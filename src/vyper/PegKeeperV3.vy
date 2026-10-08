@@ -60,6 +60,11 @@ interface PairedToken:
 interface PriceOracle:
     def price() -> uint256: view
 
+interface BoundedRatePool:
+    def virtual_price_bounded() -> uint256: view
+    def max_rate_bump() -> uint256: view
+    def poke_rates(): nonpayable
+
 
 event DirectionPaused:
     direction: indexed(uint256)
@@ -175,6 +180,7 @@ _backing_asset: ERC20
 _paired_token: PairedToken
 pool: public(Pool)
 pool_uses_dynamic_arrays: public(bool)
+pool_prices_at_bounded_rates: public(bool)
 paired_token_is_erc4626: public(bool)
 backing_multiplier: uint256
 backing_oracle: public(PriceOracle)
@@ -283,6 +289,16 @@ def __init__(
     self._paired_token = paired_token
     self.pool = _pool
     self.pool_uses_dynamic_arrays = _pool_uses_dynamic_arrays
+    bound_probe: bool = False
+    bound_response: Bytes[32] = b""
+    bound_probe, bound_response = raw_call(
+        _pool.address,
+        method_id("max_rate_bump()"),
+        max_outsize=32,
+        is_static_call=True,
+        revert_on_failure=False,
+    )
+    self.pool_prices_at_bounded_rates = bound_probe and len(bound_response) == 32
     self.paired_token_is_erc4626 = _paired_token_is_erc4626
     self.backing_multiplier = 10 ** (18 - backing_decimals)
     self.backing_oracle = _backing_oracle
@@ -399,9 +415,45 @@ def _lp_balance() -> uint256:
 
 @internal
 @view
-def _lp_value(_lp_tokens: uint256) -> uint256:
+def _bounded_lp_unit_value() -> uint256:
+    quoting: bool = False
+    response: Bytes[32] = b""
+    quoting, response = raw_call(
+        self.pool.address,
+        method_id("virtual_price_bounded()"),
+        max_outsize=32,
+        is_static_call=True,
+        revert_on_failure=False,
+    )
+    if not quoting or len(response) != 32:
+        return 0
+    return abi_decode(response, uint256)
+
+
+@internal
+@view
+def _lp_unit_value() -> uint256:
     virtual_price: uint256 = staticcall self.pool.get_virtual_price()
-    return _lp_tokens * virtual_price // PRECISION
+    if not self.pool_prices_at_bounded_rates:
+        return virtual_price
+    bounded: uint256 = self._bounded_lp_unit_value()
+    if bounded == 0:
+        return virtual_price
+    return min(virtual_price, bounded)
+
+
+@internal
+@view
+def _lp_value(_lp_tokens: uint256) -> uint256:
+    return _lp_tokens * self._lp_unit_value() // PRECISION
+
+
+@internal
+@view
+def _pool_rates_live() -> bool:
+    if not self.pool_prices_at_bounded_rates:
+        return True
+    return self._bounded_lp_unit_value() != 0
 
 
 @external
@@ -497,7 +549,7 @@ def _trusted_paired_token_value(_paired_token_units: uint256) -> uint256:
 @view
 def trusted_backing_value() -> uint256:
     """
-    @notice Returns the held pool LP balance valued at the current virtual price.
+    @notice Returns the held pool LP balance valued at the lower of the pool's two virtual prices.
     """
     return self._trusted_backing_value()
 
@@ -581,6 +633,8 @@ def _available_expansion_without_policy() -> uint256:
         return 0
     if not self._action_delay_elapsed():
         return 0
+    if not self._pool_rates_live():
+        return 0
 
     budget: uint256 = min(
         staticcall crv_usd.balanceOf(self),
@@ -598,6 +652,8 @@ def _available_contraction_without_policy() -> uint256:
     if self.all_execution_paused or self.contraction_paused:
         return 0
     if not self._action_delay_elapsed():
+        return 0
+    if not self._pool_rates_live():
         return 0
 
     held: uint256 = self._lp_balance()
@@ -746,9 +802,9 @@ def preview_contraction() -> (uint256, uint256, uint256):
     expected_lp_burn: uint256 = quoted_lp_burn + 1
     maximum_lp_burn: uint256 = self._maximum_lp_burn(quoted_lp_burn)
     assert maximum_lp_burn <= accounted
-    virtual_price: uint256 = staticcall self.pool.get_virtual_price()
-    trusted_before: uint256 = self._lp_value_at(accounted, virtual_price)
-    trusted_after: uint256 = self._lp_value_at(accounted - expected_lp_burn, virtual_price)
+    unit_value: uint256 = self._lp_unit_value()
+    trusted_before: uint256 = self._lp_value_at(accounted, unit_value)
+    trusted_after: uint256 = self._lp_value_at(accounted - expected_lp_burn, unit_value)
     trusted_removed: uint256 = trusted_before - trusted_after
     gross_profit: uint256 = self._realized_contraction_profit(
         expected_crv_usd,
@@ -780,8 +836,8 @@ def preview_expansion() -> (uint256, uint256, uint256, uint256):
     self._backing_price()
 
     lp_before: uint256 = self._lp_balance()
-    virtual_price: uint256 = staticcall self.pool.get_virtual_price()
-    lp_value_before: uint256 = self._lp_value_at(lp_before, virtual_price)
+    unit_value: uint256 = self._lp_unit_value()
+    lp_value_before: uint256 = self._lp_value_at(lp_before, unit_value)
     donated_paired_token: uint256 = self._paired_token_balance()
     donated_value: uint256 = self._trusted_paired_token_value(donated_paired_token)
     crv_usd_deployed: uint256 = amount + donated_value
@@ -793,15 +849,15 @@ def preview_expansion() -> (uint256, uint256, uint256, uint256):
     assert debt_after <= staticcall self._controller_factory.debt_ceiling(self)
 
     lp_tokens_out: uint256 = self._calc_token_amount(crv_usd_deployed, donated_paired_token)
-    lp_value_after: uint256 = self._lp_value_at(lp_before + lp_tokens_out, virtual_price)
+    lp_value_after: uint256 = self._lp_value_at(lp_before + lp_tokens_out, unit_value)
     assert lp_value_after >= accounting_baseline + crv_usd_deployed
     gross_profit: uint256 = lp_value_after - accounting_baseline - crv_usd_deployed
     reward_value: uint256 = self._keeper_reward(gross_profit)
-    keeper_reward: uint256 = reward_value * PRECISION // virtual_price
+    keeper_reward: uint256 = reward_value * PRECISION // unit_value
     assert keeper_reward <= lp_tokens_out
 
     retained_lp: uint256 = lp_before + lp_tokens_out - keeper_reward
-    retained_value: uint256 = self._lp_value_at(retained_lp, virtual_price)
+    retained_value: uint256 = self._lp_value_at(retained_lp, unit_value)
     assert retained_value >= accounting_baseline
     assert self._meets_entry_floor(gross_profit, crv_usd_deployed)
     assert retained_value >= debt_after
@@ -940,8 +996,8 @@ def _settle_lp_expansion(
     _reward_recipient: address,
 ) -> (uint256, uint256):
     lp_after_deposit: uint256 = _lp_before + _lp_received
-    virtual_price_after: uint256 = staticcall self.pool.get_virtual_price()
-    lp_value_after: uint256 = self._lp_value_at(lp_after_deposit, virtual_price_after)
+    unit_value_after: uint256 = self._lp_unit_value()
+    lp_value_after: uint256 = self._lp_value_at(lp_after_deposit, unit_value_after)
     accounting_baseline: uint256 = _lp_value_before + _donated_paired_token_value
     entry_baseline: uint256 = _lp_value_before + _entry_donation_value
     gross_profit: uint256 = 0
@@ -953,7 +1009,7 @@ def _settle_lp_expansion(
     assert self._meets_entry_floor(entry_profit, _principal)
 
     keeper_reward_value: uint256 = self._keeper_reward(gross_profit)
-    keeper_reward: uint256 = keeper_reward_value * PRECISION // virtual_price_after
+    keeper_reward: uint256 = keeper_reward_value * PRECISION // unit_value_after
     assert keeper_reward <= _lp_received
     self._transfer_exact_to(ERC20(self.pool.address), _reward_recipient, keeper_reward)
 
@@ -973,8 +1029,8 @@ def _expand_supply(_reward_recipient: address) -> (uint256, uint256, uint256):
     crv_usd_before: uint256 = staticcall crv_usd.balanceOf(self)
     paired_token_before: uint256 = self._paired_token_balance()
     lp_before: uint256 = self._lp_balance()
-    virtual_price_before: uint256 = staticcall self.pool.get_virtual_price()
-    lp_value_before: uint256 = self._lp_value_at(lp_before, virtual_price_before)
+    unit_value_before: uint256 = self._lp_unit_value()
+    lp_value_before: uint256 = self._lp_value_at(lp_before, unit_value_before)
     donated_paired_token_value: uint256 = self._trusted_paired_token_value(paired_token_before)
 
     crv_usd_deployed: uint256 = crv_usd_amount + donated_paired_token_value
@@ -1058,8 +1114,8 @@ def _settle_donated_paired_token(
         assert crv_usd_matched <= self._remaining_exposure_capacity()
 
     lp_before: uint256 = self._lp_balance()
-    virtual_price_before: uint256 = staticcall self.pool.get_virtual_price()
-    lp_value_before: uint256 = self._lp_value_at(lp_before, virtual_price_before)
+    unit_value_before: uint256 = self._lp_unit_value()
+    lp_value_before: uint256 = self._lp_value_at(lp_before, unit_value_before)
     lp_received: uint256 = self._deposit_to_pool(
         crv_usd_matched,
         paired_token_swept,
@@ -1117,6 +1173,7 @@ def withdraw_profit(_max_crv_usd_amount: uint256 = max_value(uint256)) -> uint25
     """
     assert not self.all_execution_paused
     assert not self.expansion_paused
+    assert self._pool_rates_live()
 
     backing_price: uint256 = self._backing_price()
     backing_before_sweep: uint256 = self._oracle_value(
@@ -1188,8 +1245,8 @@ def _contract_supply(_reward_recipient: address) -> (uint256, uint256, uint256):
     assert crv_usd_amount > 0
 
     lp_before: uint256 = self._lp_balance()
-    virtual_price_before: uint256 = staticcall self.pool.get_virtual_price()
-    trusted_backing_before: uint256 = self._lp_value_at(lp_before, virtual_price_before)
+    unit_value_before: uint256 = self._lp_unit_value()
+    trusted_backing_before: uint256 = self._lp_value_at(lp_before, unit_value_before)
     quoted_lp_burn: uint256 = self._calc_lp_burn(crv_usd_amount)
     maximum_lp_burn: uint256 = self._maximum_lp_burn(quoted_lp_burn)
     assert maximum_lp_burn <= lp_before
@@ -1208,8 +1265,8 @@ def _contract_supply(_reward_recipient: address) -> (uint256, uint256, uint256):
     crv_usd_received: uint256 = crv_usd_after_withdrawal - crv_usd_before
     assert crv_usd_received == crv_usd_amount
 
-    virtual_price_after: uint256 = staticcall self.pool.get_virtual_price()
-    trusted_backing_after: uint256 = self._lp_value_at(lp_after, virtual_price_after)
+    unit_value_after: uint256 = self._lp_unit_value()
+    trusted_backing_after: uint256 = self._lp_value_at(lp_after, unit_value_after)
     trusted_value_removed: uint256 = trusted_backing_before - trusted_backing_after
     assert trusted_value_removed > 0
 
@@ -1245,6 +1302,27 @@ def contract_supply() -> (uint256, uint256, uint256):
 
 
 @external
+@view
+def pool_rates_live() -> bool:
+    """
+    @notice Returns whether the pool is quoting, or halted on a rate it will not accept.
+    @dev Always true for a pool with no rate bound.
+    """
+    return self._pool_rates_live()
+
+
+@external
+@nonreentrant
+def poke_pool():
+    """
+    @notice Walks a halted pool's rates one bound back towards their sources.
+    @dev Permissionless, and capped by the pool at one poke per block.
+    """
+    assert self.pool_prices_at_bounded_rates
+    extcall BoundedRatePool(self.pool.address).poke_rates()
+
+
+@external
 @nonreentrant
 def update(_beneficiary: address = msg.sender) -> uint256:
     """
@@ -1252,6 +1330,8 @@ def update(_beneficiary: address = msg.sender) -> uint256:
     """
     assert _beneficiary != empty(address)
     if not self._action_delay_elapsed():
+        return 0
+    if not self._pool_rates_live():
         return 0
     if self._local_expansion_limit() > 0:
         crv_usd_deployed: uint256 = 0
