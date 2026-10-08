@@ -178,14 +178,14 @@ Pinned Vyper `0.4.3`, `--optimize codesize`, Prague:
 
 ```text
 PegKeeperV3 version:       3.0.0 (numeric tuple: 3, 0, 0)
-standalone initcode:      17,582 bytes
-keeper runtime core:       14,831 bytes
-standalone runtime:      14,863 bytes
-EIP-170 headroom:         9,713 bytes
+standalone initcode:      18,056 bytes
+keeper runtime core:       15,155 bytes
+standalone runtime:      15,187 bytes
+EIP-170 headroom:         9,389 bytes
 runtime core hash:
-0x01ffd4d7db52ab8aa13981d39fb4a4b1ac914a0f1a201568ab7d5b7882e8f01a
+0x692f8e37be588b2d441bda19025847aeb33097eb353231eb14a9777df0d0f20c
 mainnet runtime hash (canonical crvUSD immutable suffix):
-0xa5406b28497a8b4ec75ad1668165bd38175dfa1e6439b6fb352af71c8e32bf37
+0x418be17ea754b8b279ff2ffa4c8574a26f999d5a506806fdcc349e5eab9f0279
 
 PegKeeperPolicy runtime:   905 bytes
 policy hash:
