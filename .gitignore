@@ -3,3 +3,7 @@ out/
 cache/
 broadcast/
 .env
+
+__pycache__/
+.pytest_cache/
+test/boa/ng_build.json
