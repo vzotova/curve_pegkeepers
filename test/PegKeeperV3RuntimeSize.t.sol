@@ -15,13 +15,13 @@ contract PegKeeperV3RuntimeSizeTest is Test {
     address internal constant CRVUSD = 0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E;
     uint256 internal constant EIP_170_RUNTIME_LIMIT = 24_576;
     uint256 internal constant EIP_3860_INITCODE_LIMIT = 49_152;
-    uint256 internal constant RELEASE_KEEPER_INITCODE_SIZE = 17_582;
-    uint256 internal constant RELEASE_KEEPER_CORE_SIZE = 14_831;
+    uint256 internal constant RELEASE_KEEPER_INITCODE_SIZE = 18_056;
+    uint256 internal constant RELEASE_KEEPER_CORE_SIZE = 15_155;
     bytes32 internal constant RELEASE_KEEPER_CORE_HASH =
-        0x01ffd4d7db52ab8aa13981d39fb4a4b1ac914a0f1a201568ab7d5b7882e8f01a;
-    uint256 internal constant RELEASE_KEEPER_RUNTIME_SIZE = 14_863;
+        0x692f8e37be588b2d441bda19025847aeb33097eb353231eb14a9777df0d0f20c;
+    uint256 internal constant RELEASE_KEEPER_RUNTIME_SIZE = 15_155 + 32;
     bytes32 internal constant RELEASE_KEEPER_RUNTIME_HASH =
-        0xa5406b28497a8b4ec75ad1668165bd38175dfa1e6439b6fb352af71c8e32bf37;
+        0x418be17ea754b8b279ff2ffa4c8574a26f999d5a506806fdcc349e5eab9f0279;
 
     function test_standaloneKeeperFitsProtocolLimits() public {
         LpYieldToken crvUsd = new LpYieldToken(18);
